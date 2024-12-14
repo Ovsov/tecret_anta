@@ -1,8 +1,8 @@
-# frozen_string_literal: true
+# Gemfile
+source 'https://rubygems.org'
 
-source "https://rubygems.org"
-
-# Specify your gem's dependencies in secret_ovanta.gemspec
+# Specify your gem's dependencies in tecret_anta.gemspec
 gemspec
 
-gem "rake", "~> 13.0"
+gem 'dotenv'
+gem 'telegram-bot-ruby'

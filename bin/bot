@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+
+require 'bundler/setup'
+require 'tecret_anta'
+require 'dotenv/load'
+
+token = ENV['TELEGRAM_BOT_TOKEN']
+raise 'Please set TELEGRAM_BOT_TOKEN env variable' unless token
+
+bot = TecretAnta::Bot.new(token)
+bot.start
