@@ -1,6 +1,8 @@
 # lib/tecret_anta/bot.rb
 require 'telegram/bot'
 require 'logger'
+require_relative 'game'
+require_relative 'game_logic'
 
 module TecretAnta
   class Bot
@@ -27,14 +29,15 @@ module TecretAnta
       joined_game: '✅ Вы присоединились к игре %<name>s!',
       not_admin: 'Только администратор может выполнить это действие!',
       rollout_success: '✅ Жеребьевка для игры %<name>s завершена! Все игроки получили уведомления.',
-      santa_assignment: "🎅 В игре '%<game>s' вы дарите подарок для: %<receiver>s"
+      santa_assignment: "🎅 В игре '%<game>s' вы дарите подарок для: %<receiver>s",
+      help: "Команды бота:\n" \
+            "/start - Начать работу с ботом\n" \
+            '/help - Показать эту справку'
     }.freeze
 
     def initialize(token)
       @token = token
-      @games = {}
       @user_states = {}
-      @admin_chat_ids = {}
       @join_attempts = {}
       @logger = Logger.new(STDOUT)
     end
@@ -44,15 +47,15 @@ module TecretAnta
 
       Telegram::Bot::Client.run(@token) do |bot|
         bot.listen do |message|
-          case message
-          when Telegram::Bot::Types::Message
-            handle_message(bot, message)
-          when Telegram::Bot::Types::CallbackQuery
-            handle_callback(bot, message)
-          end
+            case message
+            when Telegram::Bot::Types::Message
+              handle_message(bot, message)
+            when Telegram::Bot::Types::CallbackQuery
+              handle_callback(bot, message)
+            end
         rescue StandardError => e
-          @logger.error "Error: #{e.message}\n#{e.backtrace.join("\n")}"
-          send_message(bot, message.try(:chat)&.id || message.try(:from)&.id, 'Произошла ошибка. Попробуйте еще раз.')
+            @logger.error "Error: #{e.message}\n#{e.backtrace.join("\n")}"
+            send_message(bot, message.try(:chat)&.id || message.try(:from)&.id, 'Произошла ошибка. Попробуйте еще раз.')
         end
       end
     end
@@ -60,15 +63,11 @@ module TecretAnta
     private
 
     def handle_message(bot, message)
-      user_id = message.from.id
-
       case message.text
       when '/start'
         send_welcome_message(bot, message)
       when '/help'
-        send_help_message(bot, message)
-      when '/rollout'
-        handle_rollout_command(bot, message)
+        send_message(bot, message.chat.id, TEXTS[:help])
       when '/done'
         handle_done_command(bot, message)
       else
@@ -100,15 +99,22 @@ module TecretAnta
       end
     end
 
+    def start_game_creation(bot, query)
+      user_id = query.from.id
+      @user_states[user_id] = { state: 'awaiting_game_name' }
+      edit_message(bot, query.message, TEXTS[:enter_game_name])
+    end
+
     def handle_text_input(bot, message)
       user_id = message.from.id
-      return unless @user_states[user_id]
+      state = @user_states[user_id]
+      return unless state
 
-      case @user_states[user_id][:state]
+      case state[:state]
       when 'awaiting_game_name'
         handle_game_name(bot, message)
       when 'awaiting_passcode'
-        handle_passcode_creation(bot, message)
+        handle_passcode(bot, message)
       when 'awaiting_capacity'
         handle_capacity(bot, message)
       when 'awaiting_exceptions'
@@ -118,15 +124,8 @@ module TecretAnta
       end
     end
 
-    def start_game_creation(bot, query)
-      user_id = query.from.id
-      @user_states[user_id] = { state: 'awaiting_game_name' }
-      @admin_chat_ids[query.from.username] = query.message.chat.id
-      edit_message(bot, query.message, TEXTS[:enter_game_name])
-    end
-
     def handle_game_name(bot, message)
-      if @games[message.text]
+      if Game.exists?(name: message.text)
         send_message(bot, message.chat.id, TEXTS[:game_exists])
         return
       end
@@ -138,7 +137,7 @@ module TecretAnta
       send_message(bot, message.chat.id, TEXTS[:enter_passcode])
     end
 
-    def handle_passcode_creation(bot, message)
+    def handle_passcode(bot, message)
       @user_states[message.from.id].update(
         state: 'awaiting_capacity',
         passcode: message.text
@@ -151,80 +150,78 @@ module TecretAnta
       user_state = @user_states[message.from.id]
 
       begin
-        game = Game.new(
+        game = Game.create!(
           name: user_state[:game_name],
           capacity: capacity,
-          admin: message.from.username,
-          passcode: user_state[:passcode]
+          admin_username: message.from.username,
+          passcode: user_state[:passcode],
+          active: true,
+          player_count: 0
         )
 
-        @games[game.name] = game
-        @user_states[message.from.id] = { state: 'awaiting_exceptions' }
-
-        send_message(
-          bot,
-          message.chat.id,
-          TEXTS[:enter_exceptions]
-        )
-      rescue ArgumentError => e
-        send_message(bot, message.chat.id, e.message)
+        game_logic = GameLogic.new(game)
+        if game_logic.add_player(message.from.username, message.chat.id)
+          @user_states[message.from.id] = { state: 'awaiting_exceptions' }
+          send_message(bot, message.chat.id, TEXTS[:enter_exceptions])
+        else
+          send_message(bot, message.chat.id, 'Error creating game')
+        end
+      rescue ActiveRecord::RecordInvalid => e
+        send_message(bot, message.chat.id, "Error: #{e.message}")
       end
     end
 
     def handle_exceptions(bot, message)
       return if message.text == '/done'
 
-      begin
-        user1, user2 = message.text.split(',').map(&:strip)
-        game_name = @games.values.find { |g| g.admin == message.from.username }&.name
+      game = Game.find_by(admin_username: message.from.username, active: true)
+      return unless game
 
-        if game_name && @games[game_name].add_exception(user1, user2)
-          send_message(
-            bot,
-            message.chat.id,
-            format(TEXTS[:exception_added], user1: user1, user2: user2)
-          )
-        else
-          send_message(bot, message.chat.id, TEXTS[:invalid_exception])
-        end
-      rescue StandardError
+      game_logic = GameLogic.new(game)
+      username1, username2 = message.text.split(',').map(&:strip)
+
+      if game_logic.add_exception(username1, username2)
+        send_message(
+          bot,
+          message.chat.id,
+          format(TEXTS[:exception_added], user1: username1, user2: username2)
+        )
+      else
         send_message(bot, message.chat.id, TEXTS[:invalid_exception])
       end
     end
 
     def handle_done_command(bot, message)
-      user_id = message.from.id
-      return unless @user_states[user_id]&.[](:state) == 'awaiting_exceptions'
+      game = Game.find_by(admin_username: message.from.username, active: true)
+      return unless game
 
-      game_name = @games.values.find { |g| g.admin == message.from.username }&.name
-      return unless game_name
-
-      @user_states.delete(user_id)
+      @user_states.delete(message.from.id)
       send_message(
         bot,
         message.chat.id,
-        format(TEXTS[:game_created], name: game_name)
+        format(TEXTS[:game_created], name: game.name)
       )
     end
 
     def show_available_games(bot, query)
-      available_games = @games.select { |_, game| !game.full? && game.active? }
+      available_games = Game.available_to_join
 
       if available_games.empty?
         edit_message(bot, query.message, TEXTS[:no_games])
         return
       end
 
-      keyboard = available_games.map do |name, _|
-        [{ text: name, callback_data: "join_#{name}" }]
+      keyboard = available_games.map do |game|
+        [{ text: "#{game.name} (#{game.player_count}/#{game.capacity})", callback_data: "join_#{game.name}" }]
       end
 
       edit_message(bot, query.message, TEXTS[:select_game], keyboard)
     end
 
     def handle_join_game(bot, query, game_name)
+      game = Game.find_by(name: game_name)
+      return edit_message(bot, query.message, TEXTS[:game_not_found]) unless game
       return edit_message(bot, query.message, TEXTS[:need_username]) unless query.from.username
-      return edit_message(bot, query.message, TEXTS[:game_not_found]) unless @games[game_name]
 
       @user_states[query.from.id] = {
         state: 'joining_game',
@@ -243,31 +240,26 @@ module TecretAnta
       state = @user_states[user_id]
       return unless state && state[:state] == 'joining_game'
 
-      game = @games[state[:game_name]]
+      game = Game.find_by(name: state[:game_name])
+      return send_message(bot, message.chat.id, TEXTS[:game_not_found]) unless game
 
-      if game.verify_passcode(message.text)
-        handle_successful_join(bot, message, game)
+      game_logic = GameLogic.new(game)
+
+      if game_logic.verify_passcode(message.text)
+        if game_logic.add_player(message.from.username, message.chat.id)
+          send_message(bot, message.chat.id, format(TEXTS[:joined_game], name: game.name))
+          notify_admin_about_new_player(bot, game)
+        else
+          send_message(
+            bot,
+            message.chat.id,
+            game.full? ? TEXTS[:game_full] : TEXTS[:already_in_game]
+          )
+        end
+        @user_states.delete(user_id)
       else
         handle_failed_join_attempt(bot, message, user_id)
       end
-    end
-
-    def handle_successful_join(bot, message, game)
-      if game.add_player(message.from.username)
-        send_message(
-          bot,
-          message.chat.id,
-          format(TEXTS[:joined_game], name: game.name)
-        )
-        notify_admin_about_new_player(bot, game, message.from.username)
-      else
-        send_message(
-          bot,
-          message.chat.id,
-          game.full? ? TEXTS[:game_full] : TEXTS[:already_in_game]
-        )
-      end
-      @user_states.delete(message.from.id)
     end
 
     def handle_failed_join_attempt(bot, message, user_id)
@@ -283,57 +275,53 @@ module TecretAnta
       end
     end
 
-    def notify_admin_about_new_player(bot, game, username)
-      admin_chat_id = @admin_chat_ids[game.admin]
+    def perform_rollout(bot, query, game_name)
+      game = Game.find_by(name: game_name)
+      return edit_message(bot, query.message, TEXTS[:game_not_found]) unless game
+      return edit_message(bot, query.message, TEXTS[:not_admin]) if query.from.username != game.admin_username
+
+      game_logic = GameLogic.new(game)
+
+      begin
+        pairs = game_logic.generate_pairs
+        pairs.each do |pair|
+          send_message(
+            bot,
+            pair[:giver][:chat_id],
+            format(TEXTS[:santa_assignment], game: game.name, receiver: pair[:receiver])
+          )
+        end
+        edit_message(
+          bot,
+          query.message,
+          format(TEXTS[:rollout_success], name: game.name)
+        )
+      rescue GameLogic::GameError => e
+        edit_message(bot, query.message, "Error: #{e.message}")
+      end
+    end
+
+    def notify_admin_about_new_player(bot, game)
+      admin_chat_id = game.players.find_by(username: game.admin_username)&.chat_id
       return unless admin_chat_id
 
+      status = GameLogic.new(game).game_status
       text = "🎅 Новый игрок в игре!\n" \
              "Игра: #{game.name}\n" \
-             "Игрок: #{username}\n" \
-             "Всего игроков: #{game.player_count}/#{game.capacity}"
+             "Всего игроков: #{status[:player_count]}/#{status[:capacity]}"
 
       send_message(bot, admin_chat_id, text)
 
       return unless game.full?
 
-      keyboard = [[{ text: 'Начать жеребьевку', callback_data: "rollout_#{game.name}" }]]
-      send_message(
-        bot,
-        admin_chat_id,
-        "🎄 Игра #{game.name} заполнена!\n" \
-        'Можно начинать жеребьевку.',
-        keyboard
-      )
-    end
-
-    def perform_rollout(bot, query, game_name)
-      game = @games[game_name]
-      return edit_message(bot, query.message, TEXTS[:game_not_found]) unless game
-      return edit_message(bot, query.message, TEXTS[:not_admin]) if query.from.username != game.admin
-
-      begin
-        pairs = game.generate_pairs
-        pairs.each do |giver, receiver|
-          chat_id = @admin_chat_ids[giver]
-          next unless chat_id
-
-          send_message(
-            bot,
-            chat_id,
-            format(TEXTS[:santa_assignment], game: game_name, receiver: receiver)
-          )
-        end
-
-        game.deactivate!
-        edit_message(
+        keyboard = [[{ text: 'Начать жеребьевку', callback_data: "rollout_#{game.name}" }]]
+        send_message(
           bot,
-          query.message,
-          format(TEXTS[:rollout_success], name: game_name)
+          admin_chat_id,
+          "🎄 Игра #{game.name} заполнена!\n" \
+          'Можно начинать жеребьевку.',
+          keyboard
         )
-      rescue StandardError => e
-        @logger.error "Rollout error: #{e.message}"
-        edit_message(bot, query.message, "Ошибка при жеребьевке: #{e.message}")
-      end
     end
 
     def send_message(bot, chat_id, text, keyboard = nil)

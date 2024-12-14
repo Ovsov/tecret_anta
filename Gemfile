@@ -6,3 +6,14 @@ gemspec
 
 gem 'dotenv'
 gem 'telegram-bot-ruby'
+# Gemfile
+gem 'activerecord'
+gem 'rake'
+
+group :development, :test do
+  gem 'sqlite3'
+end
+
+group :production do
+  gem 'pg'
+end
